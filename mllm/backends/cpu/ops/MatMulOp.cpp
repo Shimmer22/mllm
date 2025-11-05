@@ -110,6 +110,18 @@ void CPUMatMulOp::forward(const std::vector<Tensor>& inputs, std::vector<Tensor>
                                            transpose_a, transpose_b, thread_count);
         }
       }
+#elif defined(MLLM_HOST_ARCH_X86_64)
+      if (lhs.dtype() == kFloat32 && rhs.dtype() == kFloat32 && o.dtype() == kFloat32) {
+        if (batch_count == 1) {
+            x86::hwy_matmul_fp32(M, K, N, o.ptr<mllm_fp32_t>(), lhs.ptr<mllm_fp32_t>(), rhs.ptr<mllm_fp32_t>(), nullptr,
+                               transpose_a, transpose_b, thread_count);
+        } else {
+            x86::hwy_batch_matmul_fp32(batch_count, M, K, N, o.stride()[o.shape().size() - 3],
+                                     lhs.stride()[lhs_shape.size() - 3], rhs.stride()[rhs_shape.size() - 3], 0,
+                                     o.ptr<mllm_fp32_t>(), lhs.ptr<mllm_fp32_t>(), rhs.ptr<mllm_fp32_t>(), nullptr,
+                                     transpose_a, transpose_b, thread_count);
+        }
+      }
 #else
       NYI("MllmBlas only support MLLM_HOST_ARCH_ARM64 or MLLM_HOST_ARCH_ARM right now.")
 #endif
