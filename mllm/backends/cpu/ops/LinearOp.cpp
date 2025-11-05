@@ -73,6 +73,7 @@ void CPULinearOp::load(const ParameterFile::ptr_t& ploader) {
   }
 
   switch (impl_type) {
+#if defined(MLLM_HOST_ARCH_ARM64) || defined(MLLM_HOST_ARCH_ARM)
     case aops::LinearImplTypes::kMllmBlas_KAI_SGEMM_NT_NT_NEON: {
 #if defined(MLLM_HOST_ARCH_ARM64) || defined(MLLM_HOST_ARCH_ARM)
       ::mllm::cpu::arm::KaiLinear_fp32_fp32_fp32p_mxk_kxn kai_helper;
@@ -88,6 +89,7 @@ void CPULinearOp::load(const ParameterFile::ptr_t& ploader) {
 #endif
       break;
     }
+#endif
     default: {
       // No need to postprocess.
       MLLM_EMPTY_SCOPE
@@ -301,6 +303,16 @@ void CPULinearOp::forward(const std::vector<Tensor>& inputs, std::vector<Tensor>
                                          weight_.ptr<mllm_fp32_t>(), options_.bias ? bias_.ptr<mllm_fp32_t>() : nullptr, false,
                                          true, options_.getThreads());
       }
+#elif defined(MLLM_HOST_ARCH_X86_64)
+        if (batch_count == 1) {
+            x86::hwy_matmul_fp32(M, K, N, o.ptr<mllm_fp32_t>(), input.ptr<mllm_fp32_t>(), weight_.ptr<mllm_fp32_t>(),
+                                 options_.bias ? bias_.ptr<mllm_fp32_t>() : nullptr, false, true, options_.getThreads());
+        } else {
+            x86::hwy_batch_matmul_fp32(batch_count, M, K, N, o.stride()[o.shape().size() - 3],
+                                       input.stride()[input.rank() - 3], 0, 0, o.ptr<mllm_fp32_t>(), input.ptr<mllm_fp32_t>(),
+                                       weight_.ptr<mllm_fp32_t>(), options_.bias ? bias_.ptr<mllm_fp32_t>() : nullptr, false,
+                                       true, options_.getThreads());
+        }
 #else
 // TODO Other arch
 #endif

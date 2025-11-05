@@ -37,3 +37,6 @@
 	path = mllm/backends/ascend/vendors/catlass
 	url = https://gitcode.com/cann/catlass.git
 	update = none
+[submodule "third_party/highway"]
+	path = third_party/highway
+	url = https://github.com/google/highway.git

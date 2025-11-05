@@ -13,6 +13,7 @@
 #include "mllm/backends/cpu/kernels/x86/softmax.hpp"  // IWYU pragma: export
 #include "mllm/backends/cpu/kernels/x86/rmsnorm.hpp"  // IWYU pragma: export
 #include "mllm/backends/cpu/kernels/x86/gelu.hpp"     // IWYU pragma: export
+#include "mllm/backends/cpu/kernels/x86/MatMul.hpp"   // IWYU pragma: export
 #endif
 
 #if defined(MLLM_HOST_ARCH_ARM64) || defined(MLLM_HOST_ARCH_ARM)
