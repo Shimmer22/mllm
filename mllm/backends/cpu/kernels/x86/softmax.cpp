@@ -15,6 +15,15 @@
 namespace mllm::cpu::x86 {
 namespace hn = hwy::HWY_NAMESPACE;
 
+// NOTE [CUSTOM_OPTIMIZE_OR_ALIGN]:  
+// We use hn::LoadU / hn::StoreU here (instead of aligned Load/Store)  
+// because some input pointers may not meet required alignment.  
+// However, this is a fallback / workaround — performance may degrade compared  
+// to aligned access.  
+// Future improvement:  
+//   – ensure X and Y buffers are allocated with proper alignment (e.g. 32-byte)  
+//   – switch back to hn::Load / hn::Store when alignment is guaranteed  
+//   – benchmark aligned vs unaligned for this kernel on target CPU(s)  
 void softmax_v1_fp32(const mllm_fp32_t* __restrict X, mllm_fp32_t* __restrict Y, int len, int stride, int thread_count) {
   if (stride != 1 || len <= 16) {
     float max_value = std::numeric_limits<float>::lowest();
@@ -35,7 +44,7 @@ void softmax_v1_fp32(const mllm_fp32_t* __restrict X, mllm_fp32_t* __restrict Y,
   int i = 0;
   V max_vec = hn::Set(d, std::numeric_limits<float>::lowest());
   for (; i + hn::Lanes(d) <= len; i += hn::Lanes(d)) {
-    const V x_vec = hn::Load(d, X + i);
+    const V x_vec = hn::LoadU(d, X + i);
     max_vec = hn::Max(max_vec, x_vec);
   }
   float max_value = hn::ReduceMax(d, max_vec);
@@ -44,10 +53,10 @@ void softmax_v1_fp32(const mllm_fp32_t* __restrict X, mllm_fp32_t* __restrict Y,
   const V max_vec_broadcast = hn::Set(d, max_value);
   i = 0;
   for (; i + hn::Lanes(d) <= len; i += hn::Lanes(d)) {
-    const V x_vec = hn::Load(d, X + i);
+    const V x_vec = hn::LoadU(d, X + i);
     const V normalized = hn::Sub(x_vec, max_vec_broadcast);
     const V exp_vec = mllm::cpu::x86::vexpq_fast_f32(d, normalized);
-    hn::Store(exp_vec, d, Y + i);
+    hn::StoreU(exp_vec, d, Y + i);
     sum_vec = hn::Add(sum_vec, exp_vec);
   }
   float sum_value = hn::ReduceSum(d, sum_vec);
@@ -60,9 +69,9 @@ void softmax_v1_fp32(const mllm_fp32_t* __restrict X, mllm_fp32_t* __restrict Y,
   const V inv_sum_vec = hn::Set(d, sum_value);
   i = 0;
   for (; i + hn::Lanes(d) <= len; i += hn::Lanes(d)) {
-    const V y_vec = hn::Load(d, Y + i);
+    const V y_vec = hn::LoadU(d, Y + i);
     const V result = hn::Mul(y_vec, inv_sum_vec);
-    hn::Store(result, d, Y + i);
+    hn::StoreU(result, d, Y + i);
   }
   for (; i < len; ++i) { Y[i] *= sum_value; }
 }
