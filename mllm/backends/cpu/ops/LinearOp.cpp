@@ -279,6 +279,27 @@ void CPULinearOp::forward(const std::vector<Tensor>& inputs, std::vector<Tensor>
                         options_.getThreads());
       return;
     }
+#elif defined(MLLM_HOST_ARCH_X86_64)
+    case aops::LinearImplTypes::kMllmBlas_KAI_SGEMM_NT_NT_NEON:
+    case aops::LinearImplTypes::kKaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk_qai8dxp1x8_qsi4c32p4x8_1x4x32:
+    case aops::LinearImplTypes::kKaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk_qai8dxp1x8_qsi4c32p8x8_1x8x32:
+    case aops::LinearImplTypes::kKaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk_qai8dxp4x8_qsi4c32p4x8_8x4x32:
+    case aops::LinearImplTypes::kKaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk_qai8dxp4x8_qsi4c32p4x8_16x4x32:
+    case aops::LinearImplTypes::kKaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk_qai8dxp4x8_qsi4c32p8x8_4x8x32:
+    case aops::LinearImplTypes::kKaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk_qai8dxp1x4_qsi4c32p4x4_1x4:
+    {
+        // For x86, fall back to the generic highway implementation
+        if (batch_count == 1) {
+            x86::hwy_matmul_fp32(M, K, N, o.ptr<mllm_fp32_t>(), input.ptr<mllm_fp32_t>(), weight_.ptr<mllm_fp32_t>(),
+                                 options_.bias ? bias_.ptr<mllm_fp32_t>() : nullptr, false, true, options_.getThreads());
+        } else {
+            x86::hwy_batch_matmul_fp32(batch_count, M, K, N, o.stride()[o.shape().size() - 3],
+                                       input.stride()[input.rank() - 3], 0, 0, o.ptr<mllm_fp32_t>(), input.ptr<mllm_fp32_t>(),
+                                       weight_.ptr<mllm_fp32_t>(), options_.bias ? bias_.ptr<mllm_fp32_t>() : nullptr, false,
+                                       true, options_.getThreads());
+        }
+        break;
+    }
 #endif
     case aops::LinearImplTypes::kGGUF: {
       // use ggml matmul, which first try llamafile_sgemm, then fallback to ggml matmul
