@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 Tasks:
   - CMakeConfigTask:
       cmake_cfg_path: "build"
@@ -15,21 +14,3 @@ Tasks:
 
   - CMakeBuildTask:
       cmake_cfg_path: "build"
-=======
-Tasks:
-  - CMakeConfigTask:
-      cmake_cfg_path: "build"
-      cmake_build_type: "Release"
-      cmake_extra_args:
-        # Optional, If use Highway
-        - "-DHWY_ENABLE_TESTS=OFF"
-        - "-DHWY_ENABLE_EXAMPLES=OFF"
-        - "-DHWY_ENABLE_CONTRIB=OFF"
-        # Optional
-        - '-DMLLM_CPU_BACKEND_COMPILE_OPTIONS="-march=native"'
-        - "-DMLLM_KERNEL_USE_THREADS=ON"
-        - "-DMLLM_KERNEL_THREADS_VENDOR_OPENMP=ON"
-
-  - CMakeBuildTask:
-      cmake_cfg_path: "build"
->>>>>>> 9f6d0de0 (feat(cpu): update backend dev files, ignoring logs and third-party)

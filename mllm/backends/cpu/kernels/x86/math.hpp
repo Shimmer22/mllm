@@ -17,6 +17,8 @@ namespace hn = hwy::HWY_NAMESPACE;
 // Highway-based math functions for x86
 template<class D, class V>
 HWY_INLINE V vexpq_fast_f32(D d, V x) {
+  using DI = hn::Rebind<int32_t, D>;
+  DI di;
   // Implementation of fast exponential function using Highway
   const auto c_exp_hi = hn::Set(d, 88.3762626647949f);
   const auto c_exp_lo = hn::Set(d, -88.3762626647949f);
@@ -38,12 +40,11 @@ HWY_INLINE V vexpq_fast_f32(D d, V x) {
   // Express exp(x) as exp(g + n*log(2))
   auto fx = hn::MulAdd(x, c_cephes_LOG2EF, half);
 
-  // Floor
-  auto tmp = hn::Floor(fx);
+  // perform a floorf
+  auto tmp = hn::ConvertTo(d, hn::ConvertTo(di, fx));
 
-  // If greater, subtract 1
+  // if greater, substract 1
   auto mask = hn::Gt(tmp, fx);
-  // Convert mask to vector type before arithmetic operations
   auto mask_vec = hn::IfThenElse(mask, one, hn::Zero(d));
   fx = hn::Sub(tmp, mask_vec);
 
@@ -64,8 +65,6 @@ HWY_INLINE V vexpq_fast_f32(D d, V x) {
 
   // Build 2^n
   // Use Rebind on the SIMD tag type (D), not the vector type (V)
-  using DI = hn::Rebind<int32_t, D>;
-  DI di;
   auto int_vec = hn::Add(hn::ConvertTo(di, fx), hn::Set(di, 0x7f));
   auto pow2n = hn::BitCast(d, hn::ShiftLeft<23>(int_vec));
 

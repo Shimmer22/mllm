@@ -44,3 +44,6 @@ gemini_x86_dev_log*.md
 *.pdf
 gemma.cpp/
 third_party/highway/
+
+a.sh
+build.sh
