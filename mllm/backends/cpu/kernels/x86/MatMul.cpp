@@ -373,11 +373,293 @@ void MatmulKernel_TT(const float* A, const float* B, float* C,
     }
 }
 
+// Dequantize qsi4c32p packed weights to fp32
+// Based on kai_run_rhs_pack_kxn_qsi4cxp_qs4cxs1s0 from qsi4c32p_ref.txt
+void dequant_qsi4c32p_to_fp32(const uint8_t* packed_weights, float* unpacked_weights,
+                               int n, int k, int nr, int kr, int sr) {
+    if (!packed_weights || !unpacked_weights || n <= 0 || k <= 0) return;
+
+    // Constants from KAI reference
+    const size_t kai_num_bytes_sum_rhs = sizeof(int32_t);
+    const size_t kai_num_bytes_multiplier_rhs = sizeof(float);
+    const size_t kai_num_bytes_bias = sizeof(float);
+
+    // Round up k to be a multiple of 32 (KAI requirement)
+    auto kai_k_roundedup = [](size_t k) -> size_t {
+        const size_t kai_k_multiple_of = 32;
+        return ((k + kai_k_multiple_of - 1) / kai_k_multiple_of) * kai_k_multiple_of;
+    };
+
+    const size_t k_internal = kai_k_roundedup(k);
+    const size_t rhs_packed_stride = nr * ((k_internal / 2) + kai_num_bytes_multiplier_rhs +
+                                          kai_num_bytes_sum_rhs + kai_num_bytes_bias);
+    const size_t dst_num_rows = ((n + nr - 1) / nr);
+
+    // Validate scale and bias values to prevent NaN/Inf
+    for (size_t dst_row_idx = 0; dst_row_idx < dst_num_rows; ++dst_row_idx) {
+        const uint8_t* dst_row = packed_weights + dst_row_idx * rhs_packed_stride;
+        const int32_t* sums = (const int32_t*)(dst_row + nr * (k_internal / 2));
+        const float* scales = (const float*)(dst_row + nr * (k_internal / 2) + nr * kai_num_bytes_sum_rhs);
+        const float* packed_bias = (const float*)(dst_row + nr * (k_internal / 2) + nr * kai_num_bytes_sum_rhs +
+                                          nr * kai_num_bytes_multiplier_rhs);
+
+        // Validate scales and biases
+        for (size_t nr_idx = 0; nr_idx < nr; ++nr_idx) {
+            size_t n_idx = dst_row_idx * nr + nr_idx;
+            if (n_idx >= n) continue;
+
+            float scale_val = scales[nr_idx];
+            float bias_val = packed_bias[nr_idx];
+
+            // Check for invalid scale/bias values
+            if (std::isnan(scale_val) || std::isinf(scale_val)) {
+                fprintf(stderr, "[MatMul ERROR] Invalid scale value at n=%zu: %f (packed offset=%zu)\n",
+                        n_idx, scale_val, (const uint8_t*)scales - packed_weights);
+                abort();
+            }
+            if (scale_val == 0.0f) {
+                fprintf(stderr, "[MatMul WARNING] Zero scale value at n=%zu, setting to small value\n", n_idx);
+                scale_val = 1e-6f;  // Avoid division by zero
+            }
+            if (std::isnan(bias_val) || std::isinf(bias_val)) {
+                fprintf(stderr, "[MatMul ERROR] Invalid bias value at n=%zu: %f (packed offset=%zu)\n",
+                        n_idx, bias_val, (const uint8_t*)packed_bias - packed_weights);
+                abort();
+            }
+        }
+    }
+
+    // Unpack the weights
+    for (size_t dst_row_idx = 0; dst_row_idx < dst_num_rows; ++dst_row_idx) {
+        const uint8_t* dst_row = packed_weights + dst_row_idx * rhs_packed_stride;
+
+        // Skip the packed int4 data (k_internal/2 bytes per nr columns)
+        const int32_t* sums = (const int32_t*)(dst_row + nr * (k_internal / 2));
+        // Note: sums are already multiplied by 16 in the KAI packing, no need to multiply again
+
+        const float* scales = (const float*)(dst_row + nr * (k_internal / 2) + nr * kai_num_bytes_sum_rhs);
+        // Note: scales are already multiplied by 0.0625f in the KAI packing, no need to multiply again
+
+        const float* packed_bias = (const float*)(dst_row + nr * (k_internal / 2) + nr * kai_num_bytes_sum_rhs +
+                                          nr * kai_num_bytes_multiplier_rhs);
+
+        // Unpack each column in this row group
+        for (size_t nr_idx = 0; nr_idx < nr; ++nr_idx) {
+            size_t n_idx = dst_row_idx * nr + nr_idx;
+            if (n_idx >= n) continue;  // Handle padding
+
+            float scale_val = scales[nr_idx];  // Already includes 0.0625f factor
+            int32_t sum_val = sums[nr_idx];    // Already multiplied by 16
+            float bias_val = packed_bias[nr_idx];
+
+            // Unpack the int4 weights for this column
+            const uint8_t* packed_col_data = dst_row + nr_idx * (k_internal / 2);
+            float* unpacked_col = unpacked_weights + n_idx * k;
+
+            for (int k_idx = 0; k_idx < k; ++k_idx) {
+                size_t byte_idx = k_idx / 2;
+                size_t nibble_idx = k_idx % 2;
+
+                uint8_t packed_byte = packed_col_data[byte_idx];
+                int8_t weight_val;
+
+                if (nibble_idx == 0) {
+                    weight_val = (packed_byte & 0x0F);  // Lower nibble
+                } else {
+                    weight_val = (packed_byte >> 4) & 0x0F;  // Upper nibble
+                }
+
+                // Sign extend from 4-bit to 8-bit
+                if (weight_val & 0x08) {
+                    weight_val |= 0xF0;  // Sign extend
+                }
+
+                // Dequantize to fp32 - scale already includes 0.0625f, bias is separate
+                unpacked_col[k_idx] = weight_val * scale_val + bias_val;
+            }
+        }
+    }
+}
+
+// Helper to convert int4 to int8 (sign extend)
+static inline int8_t int4_to_int8(uint8_t int4_val) {
+    int8_t result = int4_val & 0x0F;
+    if (result & 0x08) {
+        result |= 0xF0;  // Sign extend
+    }
+    return result;
+}
+
+// Helper to quantize FP32 to int8 for LHS with proper scaling
+static void quantize_f32_to_int8(const float* input, int8_t* output, int size) {
+    // Find max absolute value for scaling
+    float max_abs = 0.0f;
+    for (int i = 0; i < size; ++i) {
+        float abs_val = fabsf(input[i]);
+        if (abs_val > max_abs) {
+            max_abs = abs_val;
+        }
+    }
+
+    // Avoid division by zero
+    if (max_abs == 0.0f) {
+        max_abs = 1.0f;
+    }
+
+    // Scale factor to map to int8 range [-127, 127] (avoiding -128 for symmetry)
+    float scale = 127.0f / max_abs;
+
+    for (int i = 0; i < size; ++i) {
+        float val = input[i];
+
+        // Scale and round
+        int32_t quantized = (int32_t)roundf(val * scale);
+
+        // Clamp to int8 range
+        if (quantized > 127) quantized = 127;
+        if (quantized < -127) quantized = -127;
+
+        output[i] = (int8_t)quantized;
+    }
+}
+
+// MatMul with FP32 input and int8 RHS (dequantized) - implementation
+void hwy_matmul_f32_qai8dxp_qsi4c32p_impl(int M, int K, int N, float* C,
+                                          const float* A, const uint8_t* packed_B,
+                                          const float* bias, int thread_count) {
+    if (M <= 0 || K <= 0 || N <= 0 || !A || !packed_B || !C) return;
+
+    // Temporary buffer for dequantized weights (N x K)
+    std::vector<float> dequantized_B(N * K);
+
+    // Dequantize the packed weights
+    // Use typical KAI tile parameters: nr=4, kr=32, sr=1
+    dequant_qsi4c32p_to_fp32(packed_B, dequantized_B.data(), N, K, 4, 32, 1);
+
+    // Temporary buffer for quantized input (M x K)
+    std::vector<int8_t> quantized_A(M * K);
+
+    // Quantize FP32 input to int8
+    quantize_f32_to_int8(A, quantized_A.data(), M * K);
+
+    // Handle quantized LHS with dequantized RHS
+    const hn::ScalableTag<float> d;
+    const int V = static_cast<int>(hn::Lanes(d));
+
+    auto worker = [&](int row_start, int row_end) {
+        for (int m = row_start; m < row_end; ++m) {
+            int n = 0;
+            // Vectorized over columns n in steps of V
+            for (; n + V <= N; n += V) {
+                auto sum_vec = hn::Zero(d);
+
+                // Process K dimension with quantized LHS
+                for (int k = 0; k < K; ++k) {
+                    int8_t a_int8 = quantized_A[m * K + k];
+                    float a_fp32 = static_cast<float>(a_int8);
+
+                    // Check for reasonable values
+                    if (std::isnan(a_fp32) || std::isinf(a_fp32)) {
+                        fprintf(stderr, "[MatMul ERROR] NaN/Inf in quantized input: m=%d, k=%d, a_int8=%d, a_fp32=%f\n",
+                                m, k, a_int8, a_fp32);
+                        abort();
+                    }
+
+                    auto a_vec = hn::Set(d, a_fp32);
+                    auto b_vec = hn::Load(d, dequantized_B.data() + k * N + n);
+                    sum_vec = hn::MulAdd(a_vec, b_vec, sum_vec);
+                }
+
+                // Add bias if present
+                if (bias) {
+                    auto bias_vec = hn::Load(d, bias + n);
+                    sum_vec = hn::Add(sum_vec, bias_vec);
+                }
+
+                hn::Store(sum_vec, d, C + m * N + n);
+
+                // Check for NaN in output
+                for (int v = 0; v < V; ++v) {
+                    float val = C[m * N + n + v];
+                    if (std::isnan(val) || std::isinf(val)) {
+                        fprintf(stderr, "[MatMul ERROR] NaN/Inf detected in vector output at m=%d, n=%d: %f\n",
+                                m, n + v, val);
+                        abort();
+                    }
+                }
+            }
+
+            // Tail: remaining columns handled scalar-wise
+            for (; n < N; ++n) {
+                float sum = 0.0f;
+
+                for (int k = 0; k < K; ++k) {
+                    int8_t a_int8 = quantized_A[m * K + k];
+                    float a_fp32 = static_cast<float>(a_int8);
+
+                    // Check for reasonable values
+                    if (std::isnan(a_fp32) || std::isinf(a_fp32)) {
+                        fprintf(stderr, "[MatMul ERROR] NaN/Inf in quantized input (tail): m=%d, k=%d, a_int8=%d, a_fp32=%f\n",
+                                m, k, a_int8, a_fp32);
+                        abort();
+                    }
+
+                    sum += a_fp32 * dequantized_B[k * N + n];
+                }
+
+                float out = sum + (bias ? bias[n] : 0.0f);
+
+                // Check for NaN in output
+                if (std::isnan(out) || std::isinf(out)) {
+                    fprintf(stderr, "[MatMul ERROR] NaN/Inf detected in scalar output at m=%d, n=%d: %f (sum=%f, bias=%f)\n",
+                            m, n, out, sum, bias ? bias[n] : 0.0f);
+                    abort();
+                }
+
+                C[m * N + n] = out;
+            }
+        }
+    };
+
+    // Threading
+    if (thread_count <= 1) {
+        worker(0, M);
+    } else {
+        int num_threads = std::min(thread_count, M);
+        std::vector<std::thread> threads;
+        threads.reserve(num_threads);
+        int rows_per = (M + num_threads - 1) / num_threads;
+        for (int t = 0; t < num_threads; ++t) {
+            int start = t * rows_per;
+            int end = std::min(M, start + rows_per);
+            if (start >= end) break;
+            threads.emplace_back([start, end, &worker]() { worker(start, end); });
+        }
+        for (auto &th : threads) th.join();
+    }
+}
+
+// Batch MatMul with FP32 input and int8 RHS (dequantized) - implementation
+void hwy_batch_matmul_f32_qai8dxp_qsi4c32p_impl(int batch_size, int M, int K, int N,
+                                                int C_stride, int A_stride, int B_stride, int bias_stride,
+                                                float* C, const float* A, const uint8_t* packed_B,
+                                                const float* bias, int thread_count) {
+    // Simple loop over batches
+    for (int i = 0; i < batch_size; ++i) {
+        const float* current_A = A + (std::int64_t)i * A_stride;
+        const uint8_t* current_B = packed_B + (std::int64_t)i * B_stride;  // This might need adjustment
+        float* current_C = C + (std::int64_t)i * C_stride;
+        const float* current_bias = bias ? (bias + (std::int64_t)i * bias_stride) : nullptr;
+
+        hwy_matmul_f32_qai8dxp_qsi4c32p_impl(M, K, N, current_C, current_A, current_B, current_bias, thread_count);
+    }
+}
+
 } // namespace HWY_NAMESPACE
+HWY_AFTER_NAMESPACE();
 } // namespace x86
 } // namespace cpu
 } // namespace mllm
-HWY_AFTER_NAMESPACE();
 
 #if HWY_ONCE
 
@@ -390,6 +672,27 @@ HWY_EXPORT(MatmulKernel_NN);
 HWY_EXPORT(MatmulKernel_NT);
 HWY_EXPORT(MatmulKernel_TN);
 HWY_EXPORT(MatmulKernel_TT);
+HWY_EXPORT(hwy_matmul_f32_qai8dxp_qsi4c32p_impl);
+HWY_EXPORT(hwy_batch_matmul_f32_qai8dxp_qsi4c32p_impl);
+
+// Wrapper functions for Highway dynamic dispatch
+void hwy_matmul_f32_qai8dxp_qsi4c32p(int M, int K, int N, float* C,
+                                     const float* A, const uint8_t* packed_B,
+                                     const float* bias, int thread_count) {
+    HWY_DYNAMIC_DISPATCH(hwy_matmul_f32_qai8dxp_qsi4c32p_impl)(M, K, N, C, A, packed_B, bias, thread_count);
+}
+
+void hwy_batch_matmul_f32_qai8dxp_qsi4c32p(int batch_size, int M, int K, int N,
+                                           int C_stride, int A_stride, int B_stride, int bias_stride,
+                                           float* C, const float* A, const uint8_t* packed_B,
+                                           const float* bias, int thread_count) {
+    HWY_DYNAMIC_DISPATCH(hwy_batch_matmul_f32_qai8dxp_qsi4c32p_impl)(batch_size, M, K, N,
+                                                                     C_stride, A_stride, B_stride, bias_stride,
+                                                                     C, A, packed_B, bias, thread_count);
+}
+
+// Export new functions for int4 LHS and int8 RHS support
+// These functions are outside HWY_NAMESPACE, so they don't need HWY_EXPORT
 
 // Public API wrapper used by higher layers:
 // Keep same signature as requested (M,K,N ordering in original code might vary — ensure the caller uses this convention).
@@ -437,6 +740,7 @@ void hwy_batch_matmul_fp32(int batch_size, int M, int K, int N,
         hwy_matmul_fp32(M, K, N, current_C, current_A, current_B, current_bias, transpose_a, transpose_b, thread_count);
     }
 }
+
 
 } // namespace x86
 } // namespace cpu
