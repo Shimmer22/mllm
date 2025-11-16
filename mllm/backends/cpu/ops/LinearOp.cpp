@@ -290,15 +290,31 @@ void CPULinearOp::forward(const std::vector<Tensor>& inputs, std::vector<Tensor>
     case aops::LinearImplTypes::kKaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk_qai8dxp4x8_qsi4c32p8x8_4x8x32:
     case aops::LinearImplTypes::kKaiLinear_f32_qai8dxp_qsi4c32p_mxk_nxk_qai8dxp1x4_qsi4c32p4x4_1x4:
     {
-        // For x86, fall back to the generic highway implementation
+        // For x86, use our custom int4 LHS + int8 RHS implementation
+        // Check input data types
+        if(input.dtype() != kFloat32) {
+          fprintf(stderr, "[LinearOp ERROR] Expected input dtype kFloat32 (%d), got %d\n", kFloat32, input.dtype());
+          abort();
+        }
+        if(weight_.dtype() != kByte){
+          fprintf(stderr, "[LinearOp ERROR] Expected weight dtype kByte (%d), got %d\n", kByte, weight_.dtype());
+          abort();
+        }
+        MLLM_RT_ASSERT_EQ(o.dtype(), kFloat32);
+        if (bias_) { MLLM_RT_ASSERT_EQ(bias_.dtype(), kFloat32); }
+
         if (batch_count == 1) {
-            x86::hwy_matmul_fp32(M, K, N, o.ptr<mllm_fp32_t>(), input.ptr<mllm_fp32_t>(), weight_.ptr<mllm_fp32_t>(),
-                                 options_.bias ? bias_.ptr<mllm_fp32_t>() : nullptr, false, true, options_.getThreads());
+            x86::hwy_matmul_f32_qai8dxp_qsi4c32p(M, K, N, o.ptr<mllm_fp32_t>(),
+                                                 input.ptr<mllm_fp32_t>(), weight_.ptr<mllm_uint8_t>(),
+                                                 bias_ ? bias_.ptr<mllm_fp32_t>() : nullptr, options_.getThreads());
         } else {
-            x86::hwy_batch_matmul_fp32(batch_count, M, K, N, o.stride()[o.shape().size() - 3],
-                                       input.stride()[input.rank() - 3], 0, 0, o.ptr<mllm_fp32_t>(), input.ptr<mllm_fp32_t>(),
-                                       weight_.ptr<mllm_fp32_t>(), options_.bias ? bias_.ptr<mllm_fp32_t>() : nullptr, false,
-                                       true, options_.getThreads());
+            x86::hwy_batch_matmul_f32_qai8dxp_qsi4c32p(batch_count, M, K, N,
+                                                       o.stride()[o.shape().size() - 3],
+                                                       input.stride()[input.rank() - 3], 0, 0,
+                                                       o.ptr<mllm_fp32_t>(), input.ptr<mllm_fp32_t>(),
+                                                       weight_.ptr<mllm_uint8_t>(),
+                                                       bias_ ? bias_.ptr<mllm_fp32_t>() : nullptr,
+                                                       options_.getThreads());
         }
         break;
     }

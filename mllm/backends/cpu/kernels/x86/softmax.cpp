@@ -28,18 +28,13 @@ namespace hn = hwy::HWY_NAMESPACE;
 //   – benchmark aligned vs unaligned for this kernel on target CPU(s)  
 void softmax_v1_fp32(const mllm_fp32_t* __restrict X, mllm_fp32_t* __restrict Y, int len, int stride, int thread_count) {
   if (stride != 1 || len <= 16) {
-    std::cout << "[DEBUG] Softmax entering scalar path. len=" << len << ", stride=" << stride << std::endl;
     float max_value = std::numeric_limits<float>::lowest();
     for (int i = 0; i < len; ++i) { max_value = std::max(max_value, X[i * stride]); }
-    std::cout << "[DEBUG] max_value: " << max_value << std::endl;
 
     float sum = 0.f;
     for (int i = 0; i < len; ++i) {
       auto val = X[i * stride] - max_value;
       auto tmp = expf(val);
-      if (i < 4) { // Log first few values
-          std::cout << "[DEBUG] X[" << i << "]=" << X[i*stride] << ", val=" << val << ", expf(val)=" << tmp << std::endl;
-      }
       if (std::isnan(tmp) || std::isinf(tmp)) {
           std::cout << "[ERROR] NaN/Inf detected after expf. Input to expf was: " << val << std::endl;
           abort();
@@ -47,12 +42,10 @@ void softmax_v1_fp32(const mllm_fp32_t* __restrict X, mllm_fp32_t* __restrict Y,
       Y[i * stride] = tmp;
       sum += tmp;
     }
-    std::cout << "[DEBUG] sum: " << sum << std::endl;
     if (sum == 0.f) {
         std::cout << "[ERROR] Sum is zero, division will result in Inf." << std::endl;
     }
     sum = 1.f / sum;
-    std::cout << "[DEBUG] 1/sum: " << sum << std::endl;
 
     for (int i = 0; i < len; ++i) { 
         Y[i * stride] *= sum; 
