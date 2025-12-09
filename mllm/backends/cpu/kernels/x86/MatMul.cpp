@@ -46,6 +46,13 @@ namespace HWY_NAMESPACE {
 namespace hn = hwy::HWY_NAMESPACE;
 using std::size_t;
 
+// bfloat16 to float32 conversion
+// BF16 has the same exponent bits as FP32, just truncated mantissa
+static inline float bf16_to_fp32(uint16_t bf16) {
+    uint32_t f = ((uint32_t)bf16) << 16;
+    return *reinterpret_cast<float*>(&f);
+}
+
 // Helper debug macros/functions
 #ifdef ENABLE_MATMUL_DEBUG
 static inline void debug_abort_on_nan(float val, const char* ctx, int m=-1, int n=-1, int k=-1) {
@@ -374,121 +381,127 @@ void MatmulKernel_TT(const float* A, const float* B, float* C,
 }
 
 // Dequantize qsi4c32p packed weights to fp32
-// Based on kai_run_rhs_pack_kxn_qsi4cxp_qs4cxs1s0 from qsi4c32p_ref.txt
+// Based on kai_run_rhs_pack_nxk_qsi4c32p_qsu4c32s1s0 from KleidiAI
+// Format: For each nr-column block:
+//   [For each quant block: [int4 weights: nr*(bl/2)] [scales: nr*2 (bf16)]]
+//   [sums: nr*4 (float32)]
+//   [bias: nr*4 (float32)]
 void dequant_qsi4c32p_to_fp32(const uint8_t* packed_weights, float* unpacked_weights,
                                int n, int k, int nr, int kr, int sr) {
     if (!packed_weights || !unpacked_weights || n <= 0 || k <= 0) return;
 
-    // Constants from KAI reference
-    const size_t kai_num_bytes_sum_rhs = sizeof(int32_t);
-    const size_t kai_num_bytes_multiplier_rhs = sizeof(float);
-    const size_t kai_num_bytes_bias = sizeof(float);
+    // Constants from KAI reference (kai_rhs_pack_nxk_qsi4c32p_qsu4c32s1s0.c)
+    const size_t bl = 32;  // Block length for quantization
+    const size_t num_bytes_scale = sizeof(uint16_t);  // bf16
+    const size_t num_bytes_sum = sizeof(float);       // float32
+    const size_t num_bytes_bias = sizeof(float);      // float32
 
-    // Round up k to be a multiple of 32 (KAI requirement)
-    auto kai_k_roundedup = [](size_t k) -> size_t {
-        const size_t kai_k_multiple_of = 32;
-        return ((k + kai_k_multiple_of - 1) / kai_k_multiple_of) * kai_k_multiple_of;
+    auto kai_roundup = [](size_t val, size_t mult) -> size_t {
+        return ((val + mult - 1) / mult) * mult;
     };
 
-    const size_t k_internal = kai_k_roundedup(k);
-    const size_t rhs_packed_stride = nr * ((k_internal / 2) + kai_num_bytes_multiplier_rhs +
-                                          kai_num_bytes_sum_rhs + kai_num_bytes_bias);
-    const size_t dst_num_rows = ((n + nr - 1) / nr);
+    const size_t k_rounded = kai_roundup(k, bl);
+    const size_t num_blocks_per_row = k_rounded / bl;
+    
+    // Each block contains: (bl/2) bytes of int4 weights + num_bytes_scale bytes per column
+    const size_t num_bytes_per_block = (bl / 2) + num_bytes_scale;  // 16 + 2 = 18 bytes per column
+    
+    // Stride per nr-column group: 
+    // nr * (num_bytes_per_block * num_blocks_per_row) + nr * num_bytes_sum + nr * num_bytes_bias
+    const size_t rhs_packed_stride = nr * (num_bytes_per_block * num_blocks_per_row + 
+                                           num_bytes_sum + num_bytes_bias);
+    
+    const size_t dst_num_rows = (n + nr - 1) / nr;
 
-    // Validate scale and bias values to prevent NaN/Inf
+    // Initialize output to zero
+    memset(unpacked_weights, 0, (size_t)n * k * sizeof(float));
+
     for (size_t dst_row_idx = 0; dst_row_idx < dst_num_rows; ++dst_row_idx) {
-        const uint8_t* dst_row = packed_weights + dst_row_idx * rhs_packed_stride;
-        const int32_t* sums = (const int32_t*)(dst_row + nr * (k_internal / 2));
-        const float* scales = (const float*)(dst_row + nr * (k_internal / 2) + nr * kai_num_bytes_sum_rhs);
-        const float* packed_bias = (const float*)(dst_row + nr * (k_internal / 2) + nr * kai_num_bytes_sum_rhs +
-                                          nr * kai_num_bytes_multiplier_rhs);
-
-        // Validate scales and biases
-        for (size_t nr_idx = 0; nr_idx < nr; ++nr_idx) {
+        const uint8_t* row_base = packed_weights + dst_row_idx * rhs_packed_stride;
+        
+        // Offset to sums (after all blocks): nr * num_bytes_per_block * num_blocks_per_row
+        const size_t offset_to_sums = nr * num_bytes_per_block * num_blocks_per_row;
+        const float* sums_ptr = (const float*)(row_base + offset_to_sums);
+        
+        // Offset to bias (after sums): + nr * num_bytes_sum
+        const float* bias_ptr = (const float*)(row_base + offset_to_sums + nr * num_bytes_sum);
+        
+        // Process each column in this nr-group
+        for (size_t nr_idx = 0; nr_idx < (size_t)nr; ++nr_idx) {
             size_t n_idx = dst_row_idx * nr + nr_idx;
-            if (n_idx >= n) continue;
-
-            float scale_val = scales[nr_idx];
-            float bias_val = packed_bias[nr_idx];
-
-            // Check for invalid scale/bias values
-            if (std::isnan(scale_val) || std::isinf(scale_val)) {
-                fprintf(stderr, "[MatMul ERROR] Invalid scale value at n=%zu: %f (packed offset=%zu)\n",
-                        n_idx, scale_val, (const uint8_t*)scales - packed_weights);
-                abort();
-            }
-            if (scale_val == 0.0f) {
-                fprintf(stderr, "[MatMul WARNING] Zero scale value at n=%zu, setting to small value\n", n_idx);
-                scale_val = 1e-6f;  // Avoid division by zero
-            }
+            if (n_idx >= (size_t)n) continue;
+            
+            float bias_val = bias_ptr[nr_idx];
+            float sum_val = sums_ptr[nr_idx];
+            (void)sum_val; // Sum is used for zero-point correction during matmul, not needed for simple dequant
+            
             if (std::isnan(bias_val) || std::isinf(bias_val)) {
-                fprintf(stderr, "[MatMul ERROR] Invalid bias value at n=%zu: %f (packed offset=%zu)\n",
-                        n_idx, bias_val, (const uint8_t*)packed_bias - packed_weights);
+                fprintf(stderr, "[MatMul ERROR] Invalid bias value at n=%zu: %f\n", n_idx, bias_val);
                 abort();
             }
-        }
-    }
-
-    // Unpack the weights
-    for (size_t dst_row_idx = 0; dst_row_idx < dst_num_rows; ++dst_row_idx) {
-        const uint8_t* dst_row = packed_weights + dst_row_idx * rhs_packed_stride;
-
-        // Skip the packed int4 data (k_internal/2 bytes per nr columns)
-        const int32_t* sums = (const int32_t*)(dst_row + nr * (k_internal / 2));
-        // Note: sums are already multiplied by 16 in the KAI packing, no need to multiply again
-
-        const float* scales = (const float*)(dst_row + nr * (k_internal / 2) + nr * kai_num_bytes_sum_rhs);
-        // Note: scales are already multiplied by 0.0625f in the KAI packing, no need to multiply again
-
-        const float* packed_bias = (const float*)(dst_row + nr * (k_internal / 2) + nr * kai_num_bytes_sum_rhs +
-                                          nr * kai_num_bytes_multiplier_rhs);
-
-        // Unpack each column in this row group
-        for (size_t nr_idx = 0; nr_idx < nr; ++nr_idx) {
-            size_t n_idx = dst_row_idx * nr + nr_idx;
-            if (n_idx >= n) continue;  // Handle padding
-
-            float scale_val = scales[nr_idx];  // Already includes 0.0625f factor
-            int32_t sum_val = sums[nr_idx];    // Already multiplied by 16
-            float bias_val = packed_bias[nr_idx];
-
-            // Unpack the int4 weights for this column
-            const uint8_t* packed_col_data = dst_row + nr_idx * (k_internal / 2);
+            
             float* unpacked_col = unpacked_weights + n_idx * k;
-
-            for (int k_idx = 0; k_idx < k; ++k_idx) {
-                size_t byte_idx = k_idx / 2;
-                size_t nibble_idx = k_idx % 2;
-
-                uint8_t packed_byte = packed_col_data[byte_idx];
-                int8_t weight_val;
-
-                if (nibble_idx == 0) {
-                    weight_val = (packed_byte & 0x0F);  // Lower nibble
-                } else {
-                    weight_val = (packed_byte >> 4) & 0x0F;  // Upper nibble
+            
+            // Process each quantization block
+            const uint8_t* block_ptr = row_base;
+            for (size_t block_idx = 0; block_idx < num_blocks_per_row; ++block_idx) {
+                // Layout within a block row:
+                // [nr columns of (bl/2) bytes each] [nr scales of 2 bytes each]
+                
+                // Weights for this column within this block
+                const uint8_t* weights_base = block_ptr + nr_idx * (bl / 2);
+                
+                // Scale is bf16, located after all nr column weights in this block
+                const uint16_t* scale_ptr = (const uint16_t*)(block_ptr + nr * (bl / 2));
+                uint16_t scale_bf16 = scale_ptr[nr_idx];
+                float scale_val = bf16_to_fp32(scale_bf16);
+                
+                if (std::isnan(scale_val) || std::isinf(scale_val)) {
+                    fprintf(stderr, "[MatMul ERROR] Invalid scale value at n=%zu block=%zu: %f (raw hex: 0x%04x)\n", 
+                            n_idx, block_idx, scale_val, scale_bf16);
+                    abort();
                 }
-
-                // Sign extend from 4-bit to 8-bit
-                if (weight_val & 0x08) {
-                    weight_val |= 0xF0;  // Sign extend
+                
+                // Unpack int4 values from this block
+                // The packed format uses XOR ^0x88 and interleaves k indices 0-15 with 16-31
+                for (size_t byte_idx = 0; byte_idx < bl / 2; ++byte_idx) {
+                    uint8_t packed_byte = weights_base[byte_idx];
+                    
+                    // Undo the XOR 0x88 applied during packing
+                    packed_byte ^= 0x88;
+                    
+                    // Extract low and high nibbles
+                    uint8_t val_lo = packed_byte & 0x0F;
+                    uint8_t val_hi = (packed_byte >> 4) & 0x0F;
+                    
+                    // Convert from unsigned (0-15 range with zero_point=8) to signed (-8 to 7)
+                    int8_t signed_lo = (int8_t)val_lo - 8;
+                    int8_t signed_hi = (int8_t)val_hi - 8;
+                    
+                    // K indices: The interleaving pattern places:
+                    // - low nibble at k_base + byte_idx
+                    // - high nibble at k_base + byte_idx + 16 (interleaved)
+                    size_t k_base = block_idx * bl;
+                    size_t k_idx_lo = k_base + byte_idx;
+                    size_t k_idx_hi = k_base + byte_idx + 16;
+                    
+                    if (k_idx_lo < (size_t)k) {
+                        unpacked_col[k_idx_lo] = signed_lo * scale_val + bias_val;
+                    }
+                    if (k_idx_hi < (size_t)k) {
+                        unpacked_col[k_idx_hi] = signed_hi * scale_val + bias_val;
+                    }
                 }
-
-                // Dequantize to fp32 - scale already includes 0.0625f, bias is separate
-                unpacked_col[k_idx] = weight_val * scale_val + bias_val;
+                
+                // Move to next block (weights + scales for all nr columns)
+                block_ptr += nr * num_bytes_per_block;
             }
         }
     }
 }
 
-// Helper to convert int4 to int8 (sign extend)
-static inline int8_t int4_to_int8(uint8_t int4_val) {
-    int8_t result = int4_val & 0x0F;
-    if (result & 0x08) {
-        result |= 0xF0;  // Sign extend
-    }
-    return result;
-}
+
+
 
 // Helper to quantize FP32 to int8 for LHS with proper scaling
 static void quantize_f32_to_int8(const float* input, int8_t* output, int size) {
@@ -533,8 +546,8 @@ void hwy_matmul_f32_qai8dxp_qsi4c32p_impl(int M, int K, int N, float* C,
     std::vector<float> dequantized_B(N * K);
 
     // Dequantize the packed weights
-    // Use typical KAI tile parameters: nr=4, kr=32, sr=1
-    dequant_qsi4c32p_to_fp32(packed_B, dequantized_B.data(), N, K, 4, 32, 1);
+    // Use typical KAI tile parameters: nr=8, kr=32, sr=1 (CORRECTED: nr=8 for qsi4c32p8x8)
+    dequant_qsi4c32p_to_fp32(packed_B, dequantized_B.data(), N, K, 8, 32, 1);
 
     // Temporary buffer for quantized input (M x K)
     std::vector<int8_t> quantized_A(M * K);
