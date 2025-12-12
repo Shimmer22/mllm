@@ -24,6 +24,19 @@ target_include_directories(
   MllmCUDABackendCudaOps
   PUBLIC ${CMAKE_CURRENT_LIST_DIR}/vendors/cutlass/include
          ${CMAKE_CURRENT_LIST_DIR}/vendors/cccl/include)
+
+# TileLang headers (for generated kernels)
+# NOTE: Set TILELANG_INCLUDE_DIR environment variable or adjust this path
+if(DEFINED ENV{TILELANG_INCLUDE_DIR})
+  target_include_directories(MllmCUDABackendCudaOps PUBLIC $ENV{TILELANG_INCLUDE_DIR})
+  # TileLang's 3rdparty contains CUTLASS with cute library
+  # The path structure is: TILELANG_INCLUDE_DIR/../3rdparty/cutlass/include
+  get_filename_component(TILELANG_PARENT "$ENV{TILELANG_INCLUDE_DIR}/.." ABSOLUTE)
+  target_include_directories(MllmCUDABackendCudaOps PUBLIC "${TILELANG_PARENT}/3rdparty/cutlass/include")
+else()
+  message(WARNING "TILELANG_INCLUDE_DIR not set. TileLang-generated kernels may fail to compile.")
+endif()
+
 target_compile_options(MllmCUDABackendCudaOps PRIVATE --expt-relaxed-constexpr)
 
 add_library(

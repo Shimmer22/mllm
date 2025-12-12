@@ -93,6 +93,9 @@ enum class OpTypes : int32_t {
   kRadixAttnWithSinkAndSwaDiffDim = 71,
   kRadixAttnRelax = 72,
 
+  // TileLang-generated Ops (for PoC testing)
+  kTLElementwiseAdd = 73,
+
   // Dynamic Op Start for user to register there own ops.
   kDynamicOp_Start = 4096,
 
@@ -174,6 +177,7 @@ inline std::string optype2Str(OpTypes type) {
     case OpTypes::kFlashAttention2WithSinkAndSwa: return "FlashAttention2WithSinkAndSwa";
     case OpTypes::kRadixAttnWithSinkAndSwaDiffDim: return "RadixAttnWithSinkAndSwaDiffDim";
     case OpTypes::kRadixAttnRelax: return "RadixAttnRelax";
+    case OpTypes::kTLElementwiseAdd: return "TLElementwiseAdd";
     case OpTypes::kDynamicOp_Start: return "DynamicOp_Start";
     case OpTypes::kOpType_End: return "OpType_End";
     default: return "Unknown";
