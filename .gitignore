@@ -48,3 +48,4 @@ third_party/highway/
 a.sh
 build.sh
 *_ref.txt
+LinearLayerKernel.md
