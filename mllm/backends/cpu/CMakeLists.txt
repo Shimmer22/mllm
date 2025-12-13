@@ -104,12 +104,17 @@ if(MLLM_BUILD_ARM_BACKEND)
   target_include_directories(MllmCPUBackend PUBLIC ${MLLM_KAI_INCLUDE_DIRS})
 else()
   # X86 Backend use highway kernels
+  # IMPORTANT: Set options BEFORE CPMAddPackage
+  set(HWY_ENABLE_CONTRIB ON CACHE BOOL "Enable Highway contrib library" FORCE)
+  set(HWY_ENABLE_TESTS OFF CACHE BOOL "Disable Highway tests" FORCE)
+  set(HWY_ENABLE_EXAMPLES OFF CACHE BOOL "Disable Highway examples" FORCE)
+  
   CPMAddPackage(
     NAME highway
     GITHUB_REPOSITORY google/highway
     GIT_TAG 1.3.0
   )
-  set(HWY_ENABLE_CONTRIB ON)
+  
   file(GLOB_RECURSE MLLM_CPU_BACKEND_KERNELS_SRC ${CMAKE_CURRENT_LIST_DIR}/kernels/x86/*.cpp)
   add_library(
     MllmCPUBackend SHARED

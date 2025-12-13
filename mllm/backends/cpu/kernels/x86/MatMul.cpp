@@ -381,20 +381,34 @@ void MatmulKernel_TT(const float* A, const float* B, float* C,
 }
 
 // Dequantize qsi4c32p packed weights to fp32
-// Based on kai_run_rhs_pack_nxk_qsi4c32p_qsu4c32s1s0 from KleidiAI
-// Format: For each nr-column block:
-//   [For each quant block: [int4 weights: nr*(bl/2)] [scales: nr*2 (bf16)]]
-//   [sums: nr*4 (float32)]
-//   [bias: nr*4 (float32)]
+// EXACT reverse of kai_run_rhs_pack_nxk_qsi4c32p_qsu4c32s1s0
+// 
+// Parameters from kai_matmul_clamp_f32_qai8dxp4x8_qsi4c32p8x8_4x8x32_neon_i8mm:
+//   nr = 8, kr = 16, sr = 2, bl = 32
+//   block_length_in_bytes = kr / sr = 8
+//
+// Pack layout per nr-column group:
+//   For each block (bl=32): [interleaved int4 data] [nr*2 bytes of bf16 scales]
+//   After all blocks: [nr*4 bytes float sums] [nr*4 bytes float bias]
+//
+// Critical insight from packing code:
+//   Each uint16 (2 bytes) is packed as:
+//     bits 0-3:   k0 low nibble
+//     bits 4-7:   k0+16 low nibble
+//     bits 8-11:  k0+1 high nibble
+//     bits 12-15: k0+16+1 high nibble
+//   XOR 0x8888 applied, zero_point = 8
 void dequant_qsi4c32p_to_fp32(const uint8_t* packed_weights, float* unpacked_weights,
                                int n, int k, int nr, int kr, int sr) {
     if (!packed_weights || !unpacked_weights || n <= 0 || k <= 0) return;
 
-    // Constants from KAI reference (kai_rhs_pack_nxk_qsi4c32p_qsu4c32s1s0.c)
-    const size_t bl = 32;  // Block length for quantization
-    const size_t num_bytes_scale = sizeof(uint16_t);  // bf16
-    const size_t num_bytes_sum = sizeof(float);       // float32
-    const size_t num_bytes_bias = sizeof(float);      // float32
+    const size_t bl = 32;  // Block length (quantization block size)
+    const size_t num_bytes_scale = sizeof(uint16_t);  // bf16 = 2 bytes
+    const size_t num_bytes_sum = sizeof(float);       // 4 bytes
+    const size_t num_bytes_bias = sizeof(float);      // 4 bytes
+    
+    // Use actual parameters: kr=16, sr=2 for qsi4c32p8x8_4x8x32
+    const size_t block_length_in_bytes = kr / sr;  // = 16/2 = 8
 
     auto kai_roundup = [](size_t val, size_t mult) -> size_t {
         return ((val + mult - 1) / mult) * mult;
@@ -402,233 +416,259 @@ void dequant_qsi4c32p_to_fp32(const uint8_t* packed_weights, float* unpacked_wei
 
     const size_t k_rounded = kai_roundup(k, bl);
     const size_t num_blocks_per_row = k_rounded / bl;
+    const size_t num_bytes_per_block_k = bl / 2;  // 16 bytes = 32 nibbles
     
-    // Each block contains: (bl/2) bytes of int4 weights + num_bytes_scale bytes per column
-    const size_t num_bytes_per_block = (bl / 2) + num_bytes_scale;  // 16 + 2 = 18 bytes per column
+    // Per-block: [nr columns × 16 bytes int4] + [nr × 2 bytes bf16 scale]
+    const size_t num_bytes_int4_per_block = nr * num_bytes_per_block_k;
+    const size_t num_bytes_scale_per_block = nr * num_bytes_scale;
+    const size_t num_bytes_per_block_total = num_bytes_int4_per_block + num_bytes_scale_per_block;
     
-    // Stride per nr-column group: 
-    // nr * (num_bytes_per_block * num_blocks_per_row) + nr * num_bytes_sum + nr * num_bytes_bias
-    const size_t rhs_packed_stride = nr * (num_bytes_per_block * num_blocks_per_row + 
-                                           num_bytes_sum + num_bytes_bias);
+    // Offset to sums (after all blocks)
+    const size_t offset_to_sums = num_bytes_per_block_total * num_blocks_per_row;
     
-    const size_t dst_num_rows = (n + nr - 1) / nr;
+    // Stride per nr-column group
+    const size_t rhs_packed_stride = offset_to_sums + nr * num_bytes_sum + nr * num_bytes_bias;
+    
+    const size_t dst_num_rows = kai_roundup(n, nr);
 
     // Initialize output to zero
     memset(unpacked_weights, 0, (size_t)n * k * sizeof(float));
 
-    for (size_t dst_row_idx = 0; dst_row_idx < dst_num_rows; ++dst_row_idx) {
-        const uint8_t* row_base = packed_weights + dst_row_idx * rhs_packed_stride;
+    // Debug print once
+    static bool debug_printed = false;
+
+    for (size_t dst_row_idx = 0; dst_row_idx < dst_num_rows; dst_row_idx += nr) {
+        const uint8_t* row_base = packed_weights + (dst_row_idx / nr) * rhs_packed_stride;
         
-        // Offset to sums (after all blocks): nr * num_bytes_per_block * num_blocks_per_row
-        const size_t offset_to_sums = nr * num_bytes_per_block * num_blocks_per_row;
-        const float* sums_ptr = (const float*)(row_base + offset_to_sums);
-        
-        // Offset to bias (after sums): + nr * num_bytes_sum
-        const float* bias_ptr = (const float*)(row_base + offset_to_sums + nr * num_bytes_sum);
-        
-        // Process each column in this nr-group
-        for (size_t nr_idx = 0; nr_idx < (size_t)nr; ++nr_idx) {
-            size_t n_idx = dst_row_idx * nr + nr_idx;
-            if (n_idx >= (size_t)n) continue;
+        // Process each quantization block
+        const uint8_t* block_ptr = row_base;
+        for (size_t block_idx = 0; block_idx < num_blocks_per_row; ++block_idx) {
+            // Scale for this block (bf16) - located after all int4 data in block
+            const uint16_t* scale_base = (const uint16_t*)(block_ptr + num_bytes_int4_per_block);
             
-            float bias_val = bias_ptr[nr_idx];
-            float sum_val = sums_ptr[nr_idx];
-            (void)sum_val; // Sum is used for zero-point correction during matmul, not needed for simple dequant
-            
-            if (std::isnan(bias_val) || std::isinf(bias_val)) {
-                fprintf(stderr, "[MatMul ERROR] Invalid bias value at n=%zu: %f\n", n_idx, bias_val);
-                abort();
+            // Create local scale array for this block
+            float scales[8];
+            for (size_t i = 0; i < (size_t)nr && (dst_row_idx + i) < (size_t)n; ++i) {
+                scales[i] = bf16_to_fp32(scale_base[i]);
             }
             
-            float* unpacked_col = unpacked_weights + n_idx * k;
-            
-            // Process each quantization block
-            const uint8_t* block_ptr = row_base;
-            for (size_t block_idx = 0; block_idx < num_blocks_per_row; ++block_idx) {
-                // Layout within a block row:
-                // [nr columns of (bl/2) bytes each] [nr scales of 2 bytes each]
-                
-                // Weights for this column within this block
-                const uint8_t* weights_base = block_ptr + nr_idx * (bl / 2);
-                
-                // Scale is bf16, located after all nr column weights in this block
-                const uint16_t* scale_ptr = (const uint16_t*)(block_ptr + nr * (bl / 2));
-                uint16_t scale_bf16 = scale_ptr[nr_idx];
-                float scale_val = bf16_to_fp32(scale_bf16);
-                
-                if (std::isnan(scale_val) || std::isinf(scale_val)) {
-                    fprintf(stderr, "[MatMul ERROR] Invalid scale value at n=%zu block=%zu: %f (raw hex: 0x%04x)\n", 
-                            n_idx, block_idx, scale_val, scale_bf16);
-                    abort();
+            if (!debug_printed && block_idx == 0 && dst_row_idx == 0) {
+                fprintf(stderr, "[DEBUG v5] scale_bf16[0]=0x%04x scale_val=%f\n",
+                        scale_base[0], scales[0]);
+                fprintf(stderr, "[DEBUG v5] kr=%d sr=%d block_length_in_bytes=%zu\n",
+                        kr, sr, block_length_in_bytes);
+                fprintf(stderr, "[DEBUG v5] rhs_packed_stride=%zu offset_to_sums=%zu\n",
+                        rhs_packed_stride, offset_to_sums);
+                fprintf(stderr, "[DEBUG v5] num_blocks_per_row=%zu\n", num_blocks_per_row);
+                fprintf(stderr, "[DEBUG v5] First 16 bytes of block: ");
+                for (int i = 0; i < 16; i++) {
+                    fprintf(stderr, "0x%02x ", block_ptr[i]);
                 }
+                fprintf(stderr, "\n");
                 
-                // Unpack int4 values from this block
-                // The packed format uses XOR ^0x88 and interleaves k indices 0-15 with 16-31
-                for (size_t byte_idx = 0; byte_idx < bl / 2; ++byte_idx) {
-                    uint8_t packed_byte = weights_base[byte_idx];
-                    
-                    // Undo the XOR 0x88 applied during packing
-                    packed_byte ^= 0x88;
-                    
-                    // Extract low and high nibbles
-                    uint8_t val_lo = packed_byte & 0x0F;
-                    uint8_t val_hi = (packed_byte >> 4) & 0x0F;
-                    
-                    // Convert from unsigned (0-15 range with zero_point=8) to signed (-8 to 7)
-                    int8_t signed_lo = (int8_t)val_lo - 8;
-                    int8_t signed_hi = (int8_t)val_hi - 8;
-                    
-                    // K indices: The interleaving pattern places:
-                    // - low nibble at k_base + byte_idx
-                    // - high nibble at k_base + byte_idx + 16 (interleaved)
-                    size_t k_base = block_idx * bl;
-                    size_t k_idx_lo = k_base + byte_idx;
-                    size_t k_idx_hi = k_base + byte_idx + 16;
-                    
-                    if (k_idx_lo < (size_t)k) {
-                        unpacked_col[k_idx_lo] = signed_lo * scale_val + bias_val;
-                    }
-                    if (k_idx_hi < (size_t)k) {
-                        unpacked_col[k_idx_hi] = signed_hi * scale_val + bias_val;
-                    }
+                // Print first 4 uint16 values after XOR
+                fprintf(stderr, "[DEBUG v5] First 4 uint16 values (col 0, seg 0):\n");
+                for (int i = 0; i < 4; i++) {
+                    uint16_t u16 = *((const uint16_t*)(block_ptr + i*2)) ^ 0x8888;
+                    uint8_t x0_lo = (u16 >> 0) & 0xF;
+                    uint8_t x0_hi = (u16 >> 4) & 0xF;
+                    uint8_t x1_lo = (u16 >> 8) & 0xF;
+                    uint8_t x1_hi = (u16 >> 12) & 0xF;
+                    fprintf(stderr, "  u16[%d] = 0x%04x -> k%d=%d k%d=%d k%d=%d k%d=%d\n",
+                            i, u16, i*2, (int)x0_lo-8, i*2+16, (int)x0_hi-8,
+                            i*2+1, (int)x1_lo-8, i*2+17, (int)x1_hi-8);
                 }
-                
-                // Move to next block (weights + scales for all nr columns)
-                block_ptr += nr * num_bytes_per_block;
             }
+            
+            // Mirror the exact packing loop structure:
+            // for (dst_byte_idx = 0; dst_byte_idx < 16; dst_byte_idx += 16)  -- only once
+            //   for (segment_idx = 0; segment_idx < 16/8; segment_idx++)  -- 2 times
+            //     for (nr_idx = 0; nr_idx < 8; nr_idx++)  -- 8 columns
+            //       for (block_byte_idx = 0; block_byte_idx < 8; block_byte_idx += 2) -- 4 uint16s
+            
+            const uint8_t* src_ptr = block_ptr;
+            size_t k0_idx_i = block_idx * bl;
+            
+            for (size_t dst_byte_idx = 0; dst_byte_idx < num_bytes_per_block_k; dst_byte_idx += 16) {
+                for (size_t segment_idx = 0; segment_idx < 16 / block_length_in_bytes; ++segment_idx) {
+                    for (size_t nr_idx = 0; nr_idx < (size_t)nr; ++nr_idx) {
+                        size_t n_idx = dst_row_idx + nr_idx;
+                        if (n_idx >= (size_t)n) {
+                            // Skip padding columns but still advance pointer
+                            src_ptr += block_length_in_bytes;
+                            continue;
+                        }
+                        
+                        float* unpacked_col = unpacked_weights + n_idx * k;
+                        float scale_val = scales[nr_idx];
+                        
+                        size_t k0_idx = k0_idx_i;
+                        size_t k1_idx = k0_idx_i + 16;
+                        
+                        for (size_t block_byte_idx = 0; block_byte_idx < block_length_in_bytes; block_byte_idx += 2) {
+                            // Read uint16 and undo XOR
+                            uint16_t packed_u16 = *((const uint16_t*)src_ptr) ^ 0x8888;
+                            
+                            // Extract 4 nibbles
+                            uint8_t src_x0_lo = (packed_u16 >> 0) & 0x0F;   // k0 low nibble
+                            uint8_t src_x0_hi = (packed_u16 >> 4) & 0x0F;   // k0+16 low nibble
+                            uint8_t src_x1_lo = (packed_u16 >> 8) & 0x0F;   // k0+1 high nibble
+                            uint8_t src_x1_hi = (packed_u16 >> 12) & 0x0F;  // k0+16+1 high nibble
+                            
+                            // Convert to signed: subtract zero_point (8)
+                            int8_t val_k0 = (int8_t)src_x0_lo - 8;      // k = k0
+                            int8_t val_k16 = (int8_t)src_x0_hi - 8;     // k = k0 + 16
+                            int8_t val_k1 = (int8_t)src_x1_lo - 8;      // k = k0 + 1
+                            int8_t val_k17 = (int8_t)src_x1_hi - 8;     // k = k0 + 16 + 1
+                            
+                            // Store dequantized values
+                            if (k0_idx < (size_t)k) {
+                                unpacked_col[k0_idx] = val_k0 * scale_val;
+                            }
+                            if (k1_idx < (size_t)k) {
+                                unpacked_col[k1_idx] = val_k16 * scale_val;
+                            }
+                            if (k0_idx + 1 < (size_t)k) {
+                                unpacked_col[k0_idx + 1] = val_k1 * scale_val;
+                            }
+                            if (k1_idx + 1 < (size_t)k) {
+                                unpacked_col[k1_idx + 1] = val_k17 * scale_val;
+                            }
+                            
+                            k0_idx += 2;
+                            k1_idx += 2;
+                            src_ptr += 2;
+                        }
+                    }
+                    k0_idx_i += block_length_in_bytes;
+                }
+                k0_idx_i += 16;
+            }
+            
+            // Skip past scales
+            block_ptr += num_bytes_per_block_total;
+        }
+        
+        // Print first weights after first row group is processed
+        if (!debug_printed && dst_row_idx == 0) {
+            debug_printed = true;
+            fprintf(stderr, "[DEBUG v5] After unpacking, col 0 weights [0..7]: ");
+            for (int i = 0; i < 8 && i < k; i++) {
+                fprintf(stderr, "%.4f ", unpacked_weights[0 * k + i]);
+            }
+            fprintf(stderr, "\n");
+            fprintf(stderr, "[DEBUG v5] After unpacking, col 0 weights [16..23]: ");
+            for (int i = 16; i < 24 && i < k; i++) {
+                fprintf(stderr, "%.4f ", unpacked_weights[0 * k + i]);
+            }
+            fprintf(stderr, "\n");
+            
+            // Calculate checksum for col 0
+            float checksum = 0;
+            for (int i = 0; i < k; i++) {
+                checksum += unpacked_weights[0 * k + i];
+            }
+            fprintf(stderr, "[DEBUG v5] Col 0 checksum (sum of all weights): %.6f\n", checksum);
+            
+            // Count zeros
+            int zero_count = 0;
+            for (int i = 0; i < k; i++) {
+                if (unpacked_weights[0 * k + i] == 0.0f) zero_count++;
+            }
+            fprintf(stderr, "[DEBUG v5] Col 0 zero count: %d out of %d\n", zero_count, k);
         }
     }
 }
 
 
-
-
-// Helper to quantize FP32 to int8 for LHS with proper scaling
-static void quantize_f32_to_int8(const float* input, int8_t* output, int size) {
-    // Find max absolute value for scaling
-    float max_abs = 0.0f;
-    for (int i = 0; i < size; ++i) {
-        float abs_val = fabsf(input[i]);
-        if (abs_val > max_abs) {
-            max_abs = abs_val;
-        }
-    }
-
-    // Avoid division by zero
-    if (max_abs == 0.0f) {
-        max_abs = 1.0f;
-    }
-
-    // Scale factor to map to int8 range [-127, 127] (avoiding -128 for symmetry)
-    float scale = 127.0f / max_abs;
-
-    for (int i = 0; i < size; ++i) {
-        float val = input[i];
-
-        // Scale and round
-        int32_t quantized = (int32_t)roundf(val * scale);
-
-        // Clamp to int8 range
-        if (quantized > 127) quantized = 127;
-        if (quantized < -127) quantized = -127;
-
-        output[i] = (int8_t)quantized;
-    }
-}
-
-// MatMul with FP32 input and int8 RHS (dequantized) - implementation
+// MatMul with FP32 input and packed int4 RHS (dequantized to fp32) - implementation
+// A: [M x K], B (packed): [N x K] after unpacking, C: [M x N]
+// Note: The packed format contains embedded bias, so the external bias parameter is optional
 void hwy_matmul_f32_qai8dxp_qsi4c32p_impl(int M, int K, int N, float* C,
                                           const float* A, const uint8_t* packed_B,
                                           const float* bias, int thread_count) {
     if (M <= 0 || K <= 0 || N <= 0 || !A || !packed_B || !C) return;
 
-    // Temporary buffer for dequantized weights (N x K)
+    // Temporary buffer for dequantized weights
+    // Layout: N x K (each row is a column of the original weight matrix)
     std::vector<float> dequantized_B(N * K);
 
+    // Extract embedded bias from packed weights
+    std::vector<float> embedded_bias(N, 0.0f);
+    
+    // Calculate layout parameters to find embedded bias location
+    const int nr = 8;  // For qsi4c32p8x8
+    const size_t bl = 32;
+    const size_t num_bytes_scale = 2;  // bf16
+    const size_t num_bytes_per_block_k = bl / 2;
+    const size_t k_rounded = ((K + bl - 1) / bl) * bl;
+    const size_t num_blocks_per_row = k_rounded / bl;
+    const size_t num_bytes_int4_per_block = nr * num_bytes_per_block_k;
+    const size_t num_bytes_scale_per_block = nr * num_bytes_scale;
+    const size_t num_bytes_per_block_total = num_bytes_int4_per_block + num_bytes_scale_per_block;
+    const size_t offset_to_sums = num_bytes_per_block_total * num_blocks_per_row;
+    const size_t rhs_packed_stride = offset_to_sums + nr * sizeof(float) * 2;  // sums + bias
+    const size_t dst_num_rows = (N + nr - 1) / nr;
+    
+    // Extract bias from each NR column group
+    for (size_t row_group = 0; row_group < dst_num_rows; ++row_group) {
+        const uint8_t* group_base = packed_B + row_group * rhs_packed_stride;
+        const float* bias_ptr = (const float*)(group_base + offset_to_sums + nr * sizeof(float));
+        for (int i = 0; i < nr && (row_group * nr + i) < (size_t)N; ++i) {
+            embedded_bias[row_group * nr + i] = bias_ptr[i];
+        }
+    }
+    
+    // Debug: print first 8 embedded bias values
+    static bool bias_debug_printed = false;
+    if (!bias_debug_printed) {
+        bias_debug_printed = true;
+        fprintf(stderr, "[DEBUG BIAS] First 8 embedded bias values: ");
+        for (int i = 0; i < 8 && i < N; i++) {
+            fprintf(stderr, "%.6f ", embedded_bias[i]);
+        }
+        fprintf(stderr, "\n");
+        
+        // Also print the sums values
+        const uint8_t* group_base = packed_B;
+        const float* sums_ptr = (const float*)(group_base + offset_to_sums);
+        fprintf(stderr, "[DEBUG SUMS] First 8 sums values: ");
+        for (int i = 0; i < 8; i++) {
+            fprintf(stderr, "%.6f ", sums_ptr[i]);
+        }
+        fprintf(stderr, "\n");
+    }
+
     // Dequantize the packed weights
-    // Use typical KAI tile parameters: nr=8, kr=32, sr=1 (CORRECTED: nr=8 for qsi4c32p8x8)
-    dequant_qsi4c32p_to_fp32(packed_B, dequantized_B.data(), N, K, 8, 32, 1);
+    // For qsi4c32p8x8_4x8x32: nr=8, kr=16, sr=2 (from kai_matmul header)
+    dequant_qsi4c32p_to_fp32(packed_B, dequantized_B.data(), N, K, 8, 16, 2);
 
-    // Temporary buffer for quantized input (M x K)
-    std::vector<int8_t> quantized_A(M * K);
-
-    // Quantize FP32 input to int8
-    quantize_f32_to_int8(A, quantized_A.data(), M * K);
-
-    // Handle quantized LHS with dequantized RHS
+    // Handle fp32 LHS with dequantized RHS
+    // C[m,n] = sum_k(A[m,k] * B[n,k])  -- note: B is stored as N x K (transposed)
     const hn::ScalableTag<float> d;
     const int V = static_cast<int>(hn::Lanes(d));
 
     auto worker = [&](int row_start, int row_end) {
         for (int m = row_start; m < row_end; ++m) {
-            int n = 0;
-            // Vectorized over columns n in steps of V
-            for (; n + V <= N; n += V) {
-                auto sum_vec = hn::Zero(d);
-
-                // Process K dimension with quantized LHS
-                for (int k = 0; k < K; ++k) {
-                    int8_t a_int8 = quantized_A[m * K + k];
-                    float a_fp32 = static_cast<float>(a_int8);
-
-                    // Check for reasonable values
-                    if (std::isnan(a_fp32) || std::isinf(a_fp32)) {
-                        fprintf(stderr, "[MatMul ERROR] NaN/Inf in quantized input: m=%d, k=%d, a_int8=%d, a_fp32=%f\n",
-                                m, k, a_int8, a_fp32);
-                        abort();
-                    }
-
-                    auto a_vec = hn::Set(d, a_fp32);
-                    auto b_vec = hn::Load(d, dequantized_B.data() + k * N + n);
-                    sum_vec = hn::MulAdd(a_vec, b_vec, sum_vec);
-                }
-
-                // Add bias if present
-                if (bias) {
-                    auto bias_vec = hn::Load(d, bias + n);
-                    sum_vec = hn::Add(sum_vec, bias_vec);
-                }
-
-                hn::Store(sum_vec, d, C + m * N + n);
-
-                // Check for NaN in output
-                for (int v = 0; v < V; ++v) {
-                    float val = C[m * N + n + v];
-                    if (std::isnan(val) || std::isinf(val)) {
-                        fprintf(stderr, "[MatMul ERROR] NaN/Inf detected in vector output at m=%d, n=%d: %f\n",
-                                m, n + v, val);
-                        abort();
-                    }
-                }
-            }
-
-            // Tail: remaining columns handled scalar-wise
-            for (; n < N; ++n) {
+            for (int n = 0; n < N; ++n) {
                 float sum = 0.0f;
-
+                
+                // Dot product: A[m,:] * B[n,:]
+                // A is M x K, B is N x K (weight matrix transposed)
                 for (int k = 0; k < K; ++k) {
-                    int8_t a_int8 = quantized_A[m * K + k];
-                    float a_fp32 = static_cast<float>(a_int8);
-
-                    // Check for reasonable values
-                    if (std::isnan(a_fp32) || std::isinf(a_fp32)) {
-                        fprintf(stderr, "[MatMul ERROR] NaN/Inf in quantized input (tail): m=%d, k=%d, a_int8=%d, a_fp32=%f\n",
-                                m, k, a_int8, a_fp32);
-                        abort();
-                    }
-
-                    sum += a_fp32 * dequantized_B[k * N + n];
+                    float a_val = A[m * K + k];
+                    float b_val = dequantized_B[n * K + k];  // B is N x K layout
+                    sum += a_val * b_val;
                 }
-
-                float out = sum + (bias ? bias[n] : 0.0f);
-
-                // Check for NaN in output
-                if (std::isnan(out) || std::isinf(out)) {
-                    fprintf(stderr, "[MatMul ERROR] NaN/Inf detected in scalar output at m=%d, n=%d: %f (sum=%f, bias=%f)\n",
-                            m, n, out, sum, bias ? bias[n] : 0.0f);
-                    abort();
+                
+                // Add embedded bias (from packed weights)
+                float out = sum + embedded_bias[n];
+                
+                // Also add external bias if provided (for compatibility)
+                if (bias) {
+                    out += bias[n];
                 }
-
+                
                 C[m * N + n] = out;
             }
         }
@@ -651,6 +691,7 @@ void hwy_matmul_f32_qai8dxp_qsi4c32p_impl(int M, int K, int N, float* C,
         for (auto &th : threads) th.join();
     }
 }
+
 
 // Batch MatMul with FP32 input and int8 RHS (dequantized) - implementation
 void hwy_batch_matmul_f32_qai8dxp_qsi4c32p_impl(int batch_size, int M, int K, int N,
